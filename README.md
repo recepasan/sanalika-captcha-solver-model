@@ -66,6 +66,54 @@ pip install tensorflow[and-cuda]
 python model-egitim.py
 ```
 
+### Örnek Kullanım (Standalone)
+
+```bash
+python example.py
+```
+
+```python
+from example import load_model, get_embedding, calculate_distance, find_most_similar
+
+# Modeli yükle
+model = load_model("direction_embedding_best_windows.keras")
+
+# İki görsel karşılaştır
+emb1 = get_embedding(model, "gorsel1.png")
+emb2 = get_embedding(model, "gorsel2.png")
+mesafe = calculate_distance(emb1, emb2)
+
+# Captcha çöz (clue'ya en benzer görseli bul)
+result = find_most_similar(model, "clue.png", ["opt1.png", "opt2.png", "opt3.png"])
+print(result["winner"])
+```
+
+### API ile Kullanım
+
+```bash
+python example-with-api.py
+```
+
+API `http://localhost:5000` üzerinde çalışır.
+
+**Endpoint:** `POST /download-photo`
+
+```bash
+curl -X POST http://localhost:5000/download-photo \
+  -H "Content-Type: application/json" \
+  -d '{"clue": "abc123", "keys": ["key1", "key2", "key3"]}'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "winner": {"key": "key2", "distance": 0.1234},
+  "results": [...],
+  "timing": {"total": 1.5, "download": 0.8, ...}
+}
+```
+
 ### Eğitim Parametreleri
 
 Script içinde aşağıdaki parametreleri düzenleyebilirsiniz:
