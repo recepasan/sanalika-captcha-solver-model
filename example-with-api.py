@@ -66,9 +66,11 @@ MIN_MARGIN = 0.10
 DOWNLOAD_TIMEOUT = 5
 MAX_KEYS = 16
 MAX_IMAGE_BYTES = 4 * 1024 * 1024          # 4 MB
-# Key formati: alfanumerik baslar, yalnizca guvenli karakterler.
-# ".." ayrica reddedilir - urljoin ile sunucuda ust dizine cikmayi engeller.
-KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+# Key formati: captcha anahtarlari nanoid (21 karakter, alfabe A-Za-z0-9_-).
+# '.' ve '/' alfabede olmadigi icin yol gezinme yapisal olarak imkansiz.
+# Anahtar '_' veya '-' ile baslayabilir; ilk karakteri kisitlamak gercek
+# anahtarlarin reddedilmesine yol aciyordu.
+KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 API_KEY = os.environ.get("CAPTCHA_API_KEY", "")
 
 # TLS dogrulamasi: yalnizca ortam degiskeniyle kapatilabilir.
