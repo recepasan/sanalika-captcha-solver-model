@@ -1,245 +1,225 @@
 """
-Yön Sınıflandırma Modeli - Örnek Kullanım
-=========================================
-Eğitilmiş Siamese Network modelini kullanarak
-iki görsel arasındaki benzerliği hesaplar.
+Captcha yon siniflandirma - ornek kullanim
+==========================================
+Egitilmis modeli kullanarak:
+  1) tek gorselin yonunu bulur,
+  2) iki gorselin ayni yonu gosterip gostermedigini soyler,
+  3) captcha cozer (clue ile ayni yonu gosteren secenegi bulur).
 
-Model: direction_embedding_best_windows.keras
-Girdi: 128x128 RGB görsel
-Çıktı: 1024 boyutlu embedding vektörü
+Gerekli dosyalar (model-egitim.py uretir):
+    direction_embedding.keras
+    direction_embedding_centers.npy
+    direction_embedding_meta.json
+
+Girdi : 128x128 RGB gorsel        Cikti: 128 boyutlu L2-normalize embedding
+
+DIKKAT - renk sirasi
+--------------------
+Model RGB ile egitildi (tf.image.decode_image RGB uretir). cv2.imread BGR
+dondurur; cv2 kullaniyorsaniz mutlaka cevirin:
+    img = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)
+Bu modul dosya yollarini dogrudan TensorFlow ile okudugu icin sorun yasamaz.
 """
 
-import tensorflow as tf
-import numpy as np
-import cv2
 import os
+
+import numpy as np
+
+from direction_infer import DirectionClassifier
 
 # ============================================
 # AYARLAR
 # ============================================
-MODEL_PATH = "direction_embedding_best_windows.keras"
-IMG_SIZE = (128, 128)
-THRESHOLD = 0.5  # Bu değerin altındaki mesafeler "aynı yön" olarak kabul edilir
+META_PATH = "direction_embedding_meta.json"
+TTA_VIEWS = 4       # 1, 2 veya 4. Yuksek = daha dogru, daha yavas.
+DATASET_DIR = "dataset"
 
 
 # ============================================
-# MODEL YÜKLEME
+# MODEL YUKLEME
 # ============================================
-def load_model(model_path):
-    """Embedding modelini yükler"""
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model bulunamadı: {model_path}")
-
-    print(f"Model yükleniyor: {model_path}")
-    model = tf.keras.models.load_model(
-        model_path,
-        custom_objects={
-            "lambda": lambda x: tf.math.l2_normalize(x, axis=1),
-            "Lambda": lambda x: tf.math.l2_normalize(x, axis=1)
-        },
-        safe_mode=False
-    )
-    print("Model yüklendi!")
-    return model
+def load_model(meta_path=META_PATH, tta_views=TTA_VIEWS):
+    """Modeli, sinif merkezlerini ve esikleri yukler."""
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(
+            "Metadata bulunamadi: %s\nOnce model-egitim.py ile modeli egitin."
+            % meta_path
+        )
+    print("Model yukleniyor: %s" % meta_path)
+    clf = DirectionClassifier(meta_path, tta_views=tta_views)
+    print("Model yuklendi. Siniflar: %s" % ", ".join(clf.class_names))
+    print("Guven esigi: %.3f | TTA views: %d" % (clf.conf_threshold, clf.tta_views))
+    return clf
 
 
 # ============================================
-# GÖRSEL İŞLEME
+# YON TAHMINI
 # ============================================
-def preprocess_image(image_path):
+def classify(clf, image_path):
+    """Tek gorselin yonunu dondurur.
+
+    Cikis: (yon_adi | None, guven). yon_adi None ise model emin degil,
+    yeni bir goruntu almak yanlis cevap vermekten iyidir.
     """
-    Görseli model için hazırlar.
-    - 128x128 boyutuna resize
-    - -1 ile 1 arasında normalize
-    """
-    img = cv2.imread(image_path)
-    if img is None:
-        raise ValueError(f"Görsel okunamadı: {image_path}")
-
-    # BGR -> RGB (opsiyonel, model BGR ile de çalışabilir)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # Resize
-    img = cv2.resize(img, IMG_SIZE)
-
-    # Normalize: [0, 255] -> [-1, 1]
-    img = img.astype("float32") / 127.5 - 1.0
-
-    return img
-
-
-def preprocess_batch(image_paths):
-    """Birden fazla görseli toplu işler"""
-    batch = []
-    for path in image_paths:
-        try:
-            img = preprocess_image(path)
-            batch.append(img)
-        except Exception as e:
-            print(f"Hata ({path}): {e}")
-    return np.array(batch)
+    cls, conf = clf.predict(image_path)
+    return (None if cls is None else clf.class_names[cls]), conf
 
 
 # ============================================
-# EMBEDDİNG VE MESAFE HESAPLAMA
+# EMBEDDING / MESAFE (geriye donuk uyumluluk)
 # ============================================
-def get_embedding(model, image_path):
-    """Tek bir görsel için embedding vektörü hesaplar"""
-    img = preprocess_image(image_path)
-    img_batch = np.expand_dims(img, axis=0)  # (1, 128, 128, 3)
-    embedding = model.predict(img_batch, verbose=0)
-    return embedding[0]  # (1024,)
+def get_embedding(clf, image_path):
+    """Tek gorsel icin embedding vektoru."""
+    return clf.embeddings([image_path])[0]
 
 
-def get_embeddings_batch(model, image_paths):
-    """Birden fazla görsel için embedding vektörleri hesaplar"""
-    batch = preprocess_batch(image_paths)
-    if len(batch) == 0:
+def get_embeddings_batch(clf, image_paths):
+    """Birden fazla gorsel icin embedding matrisi."""
+    if not image_paths:
         return np.array([])
-    embeddings = model.predict(batch, verbose=0, batch_size=32)
-    return embeddings
+    return clf.embeddings(image_paths)
 
 
 def calculate_distance(embedding1, embedding2):
-    """İki embedding arasındaki Öklid mesafesini hesaplar"""
-    return float(np.linalg.norm(embedding1 - embedding2))
+    """Iki embedding arasindaki Oklid mesafesi (L2-normalize => [0, 2])."""
+    return float(np.linalg.norm(np.asarray(embedding1) - np.asarray(embedding2)))
 
 
-def find_most_similar(model, clue_path, candidate_paths):
-    """
-    Clue görseline en benzer candidate'ı bulur.
-
-    Args:
-        model: Yüklenmiş embedding modeli
-        clue_path: Referans görsel yolu
-        candidate_paths: Karşılaştırılacak görsellerin yolları
-
-    Returns:
-        dict: En benzer görselin bilgileri
-    """
-    # Tüm görselleri tek batch'te işle (daha hızlı)
-    all_paths = [clue_path] + candidate_paths
-    embeddings = get_embeddings_batch(model, all_paths)
-
-    if len(embeddings) < 2:
-        raise ValueError("Yeterli görsel işlenemedi")
-
-    clue_embedding = embeddings[0]
-
-    results = []
-    for i, path in enumerate(candidate_paths):
-        dist = calculate_distance(clue_embedding, embeddings[i + 1])
-        results.append({
-            "path": path,
-            "distance": dist,
-            "is_same_direction": dist < THRESHOLD
-        })
-
-    # En düşük mesafe = en benzer
-    results.sort(key=lambda x: x["distance"])
-
-    return {
-        "winner": results[0],
-        "all_results": results
-    }
+def is_same_direction(clf, path1, path2):
+    """Iki gorsel ayni yonu mu gosteriyor? (yon siniflandirmasiyla karar)"""
+    (a, ca), (b, cb) = clf.predict_batch([path1, path2])
+    if a is None or b is None:      # en az biri belirsiz
+        return None, min(ca, cb)
+    return a == b, min(ca, cb)
 
 
 # ============================================
-# ÖRNEK KULLANIM
+# CAPTCHA COZME
 # ============================================
-if __name__ == "__main__":
-    # 1. Modeli yükle
+def find_most_similar(clf, clue_path, candidate_paths, min_margin=0.10):
+    """clue ile ayni yonu gosteren secenegi bulur.
+
+    Skorlama yon uyumu olasiligi uzerinden yapilir; ham embedding mesafesi
+    de raporlanir. Donen sozluk eski surumle uyumludur ("winner",
+    "all_results", her kayitta "path" ve "distance").
+    """
+    res = clf.solve_captcha(clue_path, candidate_paths, min_margin=min_margin)
+    for c in res["candidates"]:
+        c["path"] = c["value"]
+    res["winner"]["path"] = res["winner"]["value"]
+    res["all_results"] = res["candidates"]
+    return res
+
+
+# ============================================
+# ORNEK KULLANIM
+# ============================================
+def _images_in(class_dir):
+    return sorted(
+        f for f in os.listdir(class_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))
+    )
+
+
+def main():
     try:
-        model = load_model(MODEL_PATH)
-    except FileNotFoundError as e:
-        print(f"HATA: {e}")
-        print("Önce model-egitim.py ile modeli eğitin.")
-        exit(1)
+        clf = load_model()
+    except FileNotFoundError as exc:
+        print("HATA: %s" % exc)
+        return 1
 
-    # 2. Örnek: İki görsel karşılaştır
-    print("\n" + "="*50)
-    print("ÖRNEK 1: İki görsel karşılaştırma")
-    print("="*50)
+    if not os.path.isdir(DATASET_DIR):
+        print("\n%s klasoru yok. Kendi gorsellerinizle:" % DATASET_DIR)
+        print("  yon, guven = classify(clf, 'gorsel.png')")
+        print("  sonuc = find_most_similar(clf, 'clue.png', ['a.png', 'b.png'])")
+        return 0
 
-    # Dataset klasöründen örnek görseller (varsa)
-    dataset_dir = "dataset"
-    if os.path.exists(dataset_dir):
-        # İlk iki sınıftan birer görsel al
-        classes = sorted(os.listdir(dataset_dir))
-        if len(classes) >= 2:
-            class1_dir = os.path.join(dataset_dir, classes[0])
-            class2_dir = os.path.join(dataset_dir, classes[1])
+    classes = sorted(d for d in os.listdir(DATASET_DIR)
+                     if os.path.isdir(os.path.join(DATASET_DIR, d)))
+    if len(classes) < 3:
+        print("Ornekler icin en az 3 sinif gerekiyor.")
+        return 0
 
-            img1_list = [f for f in os.listdir(class1_dir) if f.endswith(('.png', '.jpg'))]
-            img2_list = [f for f in os.listdir(class2_dir) if f.endswith(('.png', '.jpg'))]
+    # ---- 1) Tek gorselin yonu ----
+    print("\n" + "=" * 55)
+    print("ORNEK 1: Tek gorselin yonu")
+    print("=" * 55)
+    for cls in classes[:3]:
+        d = os.path.join(DATASET_DIR, cls)
+        imgs = _images_in(d)
+        if not imgs:
+            continue
+        path = os.path.join(d, imgs[0])
+        yon, conf = classify(clf, path)
+        print("  %-40s -> %-14s (conf=%.3f)"
+              % (os.path.basename(path), yon or "EMIN DEGIL", conf))
+        print("     gercek etiket: %s" % cls)
 
-            if img1_list and img2_list:
-                img1_path = os.path.join(class1_dir, img1_list[0])
-                img2_path = os.path.join(class2_dir, img2_list[0])
+    # ---- 2) Iki gorsel karsilastirma ----
+    print("\n" + "=" * 55)
+    print("ORNEK 2: Iki gorsel ayni yonu mu gosteriyor?")
+    print("=" * 55)
+    d0 = os.path.join(DATASET_DIR, classes[0])
+    d1 = os.path.join(DATASET_DIR, classes[1])
+    i0, i1 = _images_in(d0), _images_in(d1)
+    if len(i0) >= 2 and i1:
+        ayni = os.path.join(d0, i0[0]), os.path.join(d0, i0[1])
+        farkli = os.path.join(d0, i0[0]), os.path.join(d1, i1[0])
+        for etiket, (p, q) in (("ayni sinif", ayni), ("farkli sinif", farkli)):
+            karar, conf = is_same_direction(clf, p, q)
+            emb = get_embeddings_batch(clf, [p, q])
+            print("  %-13s -> ayni yon: %-9s mesafe=%.3f  (min conf=%.3f)"
+                  % (etiket,
+                     {True: "EVET", False: "HAYIR", None: "BELIRSIZ"}[karar],
+                     calculate_distance(emb[0], emb[1]), conf))
 
-                emb1 = get_embedding(model, img1_path)
-                emb2 = get_embedding(model, img2_path)
+    # ---- 3) Captcha cozme ----
+    print("\n" + "=" * 55)
+    print("ORNEK 3: Captcha cozme (clue + secenekler)")
+    print("=" * 55)
+    clue_cls = classes[0]
+    clue_dir = os.path.join(DATASET_DIR, clue_cls)
+    clue_imgs = _images_in(clue_dir)
+    if len(clue_imgs) < 2:
+        print("Yeterli gorsel yok.")
+        return 0
 
-                dist = calculate_distance(emb1, emb2)
+    clue_path = os.path.join(clue_dir, clue_imgs[0])
+    dogru_cevap = os.path.join(clue_dir, clue_imgs[1])
+    secenekler = [dogru_cevap]
+    for cls in classes[1:4]:
+        d = os.path.join(DATASET_DIR, cls)
+        imgs = _images_in(d)
+        if imgs:
+            secenekler.append(os.path.join(d, imgs[0]))
 
-                print(f"Görsel 1: {img1_path}")
-                print(f"Görsel 2: {img2_path}")
-                print(f"Mesafe: {dist:.4f}")
-                print(f"Aynı yön mü?: {'Evet' if dist < THRESHOLD else 'Hayır'}")
-    else:
-        print("Dataset klasörü bulunamadı.")
-        print("Kendi görsellerinizle test etmek için:")
-        print("  emb = get_embedding(model, 'gorsel.png')")
+    print("  clue        : %s  (gercek yon: %s)" % (os.path.basename(clue_path), clue_cls))
+    print("  dogru cevap : %s" % os.path.basename(dogru_cevap))
+    print("  secenek     : %d adet" % len(secenekler))
 
-    # 3. Örnek: Clue + Candidates (Captcha çözme senaryosu)
-    print("\n" + "="*50)
-    print("ÖRNEK 2: Captcha çözme senaryosu")
-    print("="*50)
+    sonuc = find_most_similar(clf, clue_path, secenekler)
+    print("\n  clue tahmini: %s (conf=%.3f%s)"
+          % (sonuc["clue"]["direction"], sonuc["clue"]["confidence"],
+             "" if sonuc["clue"]["certain"] else ", EMIN DEGIL"))
+    print("\n  secenekler (yon uyumuna gore sirali):")
+    for i, c in enumerate(sonuc["all_results"]):
+        print("    %sskor=%.3f  yon=%-14s mesafe=%.3f  %s"
+              % ("-> " if i == 0 else "   ", c["score"], c["direction"],
+                 c["distance"], os.path.basename(c["path"])))
 
-    if os.path.exists(dataset_dir):
-        classes = sorted(os.listdir(dataset_dir))
-        if len(classes) >= 3:
-            # Clue: İlk sınıftan bir görsel
-            clue_class = classes[0]
-            clue_dir = os.path.join(dataset_dir, clue_class)
-            clue_images = [f for f in os.listdir(clue_dir) if f.endswith(('.png', '.jpg'))]
+    kazanan = sonuc["winner"]["path"]
+    print("\n  kazanan: %s" % os.path.basename(kazanan))
+    print("  margin : %.3f%s" % (sonuc["margin"],
+                                 "  [YENIDEN DENE]" if sonuc["needs_retry"] else ""))
+    print("  sonuc  : %s" % ("DOGRU" if kazanan == dogru_cevap else "YANLIS"))
 
-            if clue_images:
-                clue_path = os.path.join(clue_dir, clue_images[0])
-
-                # Candidates: Aynı sınıftan + farklı sınıflardan görseller
-                candidates = []
-
-                # Aynı sınıftan bir tane (doğru cevap olması gereken)
-                if len(clue_images) > 1:
-                    candidates.append(os.path.join(clue_dir, clue_images[1]))
-
-                # Farklı sınıflardan
-                for cls in classes[1:4]:  # 3 farklı sınıf
-                    cls_dir = os.path.join(dataset_dir, cls)
-                    cls_images = [f for f in os.listdir(cls_dir) if f.endswith(('.png', '.jpg'))]
-                    if cls_images:
-                        candidates.append(os.path.join(cls_dir, cls_images[0]))
-
-                if candidates:
-                    print(f"Clue: {clue_path}")
-                    print(f"Candidates: {len(candidates)} adet")
-
-                    result = find_most_similar(model, clue_path, candidates)
-
-                    print(f"\nSonuçlar (mesafeye göre sıralı):")
-                    for i, r in enumerate(result["all_results"]):
-                        marker = " <-- EN BENZER" if i == 0 else ""
-                        print(f"  {r['distance']:.4f} - {os.path.basename(r['path'])}{marker}")
-
-                    print(f"\nKazanan: {result['winner']['path']}")
-                    print(f"Mesafe: {result['winner']['distance']:.4f}")
-    else:
-        print("Dataset klasörü bulunamadı.")
-        print("\nKullanım:")
-        print("  result = find_most_similar(model, 'clue.png', ['opt1.png', 'opt2.png', 'opt3.png'])")
-        print("  print(result['winner'])")
-
-    print("\n" + "="*50)
+    print("\n" + "=" * 55)
     print("TAMAMLANDI")
-    print("="*50)
+    print("=" * 55)
+    print("\nUctan uca dogrulugu olcmek icin:")
+    print("  python direction_infer.py --meta %s \\" % META_PATH)
+    print("      --eval direction_embedding_predictions.csv --simulate 300")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,296 +1,343 @@
 """
-Yön Sınıflandırma - API Örneği
-==============================
-Flask API ile captcha çözme servisi.
+Captcha yon siniflandirma - Flask API
+=====================================
+POST /solve
+    {"clue": "<key>", "keys": ["<key>", "<key>", ...]}
+    -> hangi key'in clue ile ayni yonu gosterdigini dondurur
 
-Kullanım:
+POST /direction
+    {"key": "<key>"}
+    -> tek gorselin yonunu dondurur
+
+GET  /health
+    -> model yuklu mu, hangi ayarlarla
+
+Onceki surume gore duzeltmeler
+------------------------------
+1) RENK SIRASI: onceki surum cv2.imread ile BGR okuyup modele veriyordu ama
+   model RGB ile egitilmisti (example.py ceviriyordu, API cevirmiyordu).
+   Artik goruntuler tf.image.decode_image ile dogrudan RGB olarak cozuluyor.
+2) DISKE YAZMA YOK: onceki surum indirdigi captcha gorsellerini
+   DOWNLOAD_FOLDER="dataset" icine yaziyordu, yani egitim veri klasorunu
+   etiketlenmemis dosyalarla kirletiyordu. Artik indirilen veri bellekte
+   islenir; hicbir dosya yazilmaz.
+3) PATH TRAVERSAL: dosya adi kullanicidan gelen key ile uretiliyordu
+   (f"{prefix}{key}{ext}"), "../" iceren bir key klasor disina yazabilirdi.
+   Diske yazma kalktigi icin risk ortadan kalkti; ayrica key formati
+   dogrulaniyor.
+4) SKORLAMA: ham embedding mesafesi yerine yon uyumu olasiligi kullaniliyor,
+   TTA uygulaniyor ve emin olunmayan sonuclar needs_retry ile isaretleniyor.
+
+GUVENLIK - deploy etmeden once okuyun
+-------------------------------------
+Bu endpoint kimlik dogrulamasi ICERMEZ. Varsayilan olarak yalnizca
+127.0.0.1'e baglanir, yani sadece ayni makineden erisilebilir.
+  - Aga acmak icin  : --host 0.0.0.0  (bilinerek yapin)
+  - Basit koruma icin: CAPTCHA_API_KEY ortam degiskenini ayarlayin; ayarliysa
+    her istekte X-API-Key basligi zorunlu olur.
+Aga acip API key ayarlamazsaniz, agdaki herkes servisi kullanabilir.
+
+Kullanim:
     python example-with-api.py
-
-Endpoint:
-    POST http://localhost:5000/download-photo
-    Body: {"clue": "abc123", "keys": ["key1", "key2", "key3"]}
+    CAPTCHA_API_KEY=gizli python example-with-api.py --host 0.0.0.0
 """
 
-from flask import Flask, jsonify, request
-import numpy as np
-import cv2
-import tensorflow as tf
-import os
-import sys
-import time
+import argparse
 import concurrent.futures
-from urllib.parse import urljoin
-import requests
+import os
+import re
+import sys
 import threading
-import urllib3
+import time
+from urllib.parse import urljoin
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import requests
+from flask import Flask, jsonify, request
+
+from direction_infer import DirectionClassifier
 
 # ============================================
 # AYARLAR
 # ============================================
-MODEL_PATH = "direction_embedding_best_windows.keras"
-IMG_SIZE = (128, 128)
+META_PATH = "direction_embedding_meta.json"
 CAPTCHA_BASE_URL = "https://fs.sanalika.com/global/captcha/"
-DOWNLOAD_FOLDER = "dataset"
+TTA_VIEWS = 4
+MIN_MARGIN = 0.10
+DOWNLOAD_TIMEOUT = 5
+MAX_KEYS = 16
+MAX_IMAGE_BYTES = 4 * 1024 * 1024          # 4 MB
+# Key formati: alfanumerik baslar, yalnizca guvenli karakterler.
+# ".." ayrica reddedilir - urljoin ile sunucuda ust dizine cikmayi engeller.
+KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+API_KEY = os.environ.get("CAPTCHA_API_KEY", "")
 
-# Global model cache
-_model_cache = None
-_model_lock = threading.Lock()
+# TLS dogrulamasi: yalnizca ortam degiskeniyle kapatilabilir.
+# Kapatmak ortadaki adam saldirilarina acik hale getirir, gecici teshis icin.
+VERIFY_TLS = os.environ.get("CAPTCHA_INSECURE_TLS", "0") != "1"
+
+_clf = None
+_clf_lock = threading.Lock()
 
 app = Flask(__name__)
 
 
 # ============================================
-# MODEL
+# MODEL (tek kez yuklenir)
 # ============================================
-def get_model():
-    """Model'i cache'leyerek sadece bir kez yükler"""
-    global _model_cache
-
-    if _model_cache is None:
-        with _model_lock:
-            if _model_cache is None:
-                if getattr(sys, 'frozen', False):
-                    application_path = os.path.dirname(sys.executable)
-                else:
-                    application_path = os.path.dirname(os.path.abspath(__file__))
-
-                model_path = os.path.join(application_path, MODEL_PATH)
-
-                if not os.path.exists(model_path):
-                    raise FileNotFoundError(f"Model bulunamadı: {model_path}")
-
-                print("🚀 Model yükleniyor (ilk kez)...")
-                _model_cache = tf.keras.models.load_model(
-                    model_path,
-                    custom_objects={
-                        "lambda": lambda x: tf.math.l2_normalize(x, axis=1),
-                        "Lambda": lambda x: tf.math.l2_normalize(x, axis=1)
-                    },
-                    safe_mode=False
-                )
-                print("✓ Model cache'lendi")
-
-    return _model_cache
+def get_classifier():
+    global _clf
+    if _clf is None:
+        with _clf_lock:
+            if _clf is None:
+                base = (os.path.dirname(sys.executable)
+                        if getattr(sys, "frozen", False)
+                        else os.path.dirname(os.path.abspath(__file__)))
+                meta = os.path.join(base, META_PATH)
+                if not os.path.exists(meta):
+                    raise FileNotFoundError(
+                        "Metadata bulunamadi: %s (once model-egitim.py calistirin)"
+                        % meta
+                    )
+                print("Model yukleniyor...")
+                _clf = DirectionClassifier(meta, tta_views=TTA_VIEWS)
+                print("Model hazir | esik=%.3f | TTA=%d"
+                      % (_clf.conf_threshold, _clf.tta_views))
+    return _clf
 
 
 # ============================================
-# ENDPOINT: /download-photo
+# YARDIMCILAR
 # ============================================
-@app.route('/download-photo', methods=['POST'])
-def download_photo():
-    """
-    Captcha çözme endpoint'i.
+def require_api_key():
+    """API_KEY ayarliysa X-API-Key basligini zorunlu kilar."""
+    if not API_KEY:
+        return None
+    if request.headers.get("X-API-Key", "") != API_KEY:
+        return jsonify({"error": "gecersiz veya eksik X-API-Key"}), 401
+    return None
 
-    Request Body:
-        {
-            "clue": "abc123",
-            "keys": ["key1", "key2", "key3", "key4"]
-        }
 
-    Response:
-        {
-            "success": true,
-            "winner": {"key": "key2", "distance": 0.1234},
-            "results": [...],
-            "timing": {...}
-        }
-    """
-    start_time = time.time()
+def valid_key(key):
+    if not isinstance(key, str) or ".." in key:
+        return False
+    return bool(KEY_PATTERN.match(key))
+
+
+def fetch_image(key, session):
+    """Captcha gorselini bellege indirir. Diske yazmaz."""
+    try:
+        url = urljoin(CAPTCHA_BASE_URL, key)
+        resp = session.get(url, timeout=DOWNLOAD_TIMEOUT, verify=VERIFY_TLS,
+                           stream=True)
+        resp.raise_for_status()
+        data = resp.raw.read(MAX_IMAGE_BYTES + 1, decode_content=True)
+        if len(data) > MAX_IMAGE_BYTES:
+            return {"key": key, "error": "gorsel cok buyuk (>%d bayt)"
+                    % MAX_IMAGE_BYTES}
+        if not data:
+            return {"key": key, "error": "bos yanit"}
+        return {"key": key, "data": data, "bytes": len(data)}
+    except Exception as exc:
+        return {"key": key, "error": str(exc)}
+
+
+def fetch_all(keys):
+    """Tum key'leri paralel indirir; sirayi korur."""
+    out = [None] * len(keys)
+    with requests.Session() as session:
+        workers = min(10, max(len(keys), 1))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(fetch_image, k, session): i
+                       for i, k in enumerate(keys)}
+            for fut in concurrent.futures.as_completed(futures):
+                out[futures[fut]] = fut.result()
+    return out
+
+
+# ============================================
+# ENDPOINT: /solve
+# ============================================
+@app.route("/solve", methods=["POST"])
+@app.route("/download-photo", methods=["POST"])   # eski isim, geriye uyumluluk
+def solve():
+    t_start = time.perf_counter()
+
+    denied = require_api_key()
+    if denied:
+        return denied
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "JSON govdesi bulunamadi"}), 400
+
+    clue = data.get("clue")
+    keys = data.get("keys")
+
+    if not valid_key(clue):
+        return jsonify({"error": "gecersiz clue"}), 400
+    if not isinstance(keys, list) or not keys:
+        return jsonify({"error": "keys dizisi bulunamadi"}), 400
+    if len(keys) > MAX_KEYS:
+        return jsonify({"error": "en fazla %d key" % MAX_KEYS}), 400
+    bad = [k for k in keys if not valid_key(k)]
+    if bad:
+        return jsonify({"error": "gecersiz key(ler)", "keys": bad[:5]}), 400
 
     try:
-        # JSON validasyonu
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "JSON verisi bulunamadı"}), 400
+        clf = get_classifier()
+    except Exception as exc:
+        return jsonify({"error": "model yuklenemedi: %s" % exc}), 500
 
-        keys = data.get("keys")
-        clue = data.get("clue")
+    t_dl = time.perf_counter()
+    fetched = fetch_all([clue] + keys)
+    t_dl = time.perf_counter() - t_dl
 
-        if not keys or not isinstance(keys, list):
-            return jsonify({"error": "keys dizisi bulunamadı"}), 400
+    clue_res, cand_res = fetched[0], fetched[1:]
+    if "error" in clue_res:
+        return jsonify({"error": "clue indirilemedi: %s" % clue_res["error"]}), 502
 
-        if not clue:
-            return jsonify({"error": "clue bulunamadı"}), 400
+    ok = [r for r in cand_res if "data" in r]
+    failed = [{"key": r["key"], "error": r["error"]} for r in cand_res if "error" in r]
+    if not ok:
+        return jsonify({"error": "hicbir key indirilemedi", "failed": failed}), 502
 
-        # Paths
-        if getattr(sys, 'frozen', False):
-            application_path = os.path.dirname(sys.executable)
-        else:
-            application_path = os.path.dirname(os.path.abspath(__file__))
+    t_inf = time.perf_counter()
+    try:
+        res = clf.solve_captcha(clue_res["data"], [r["data"] for r in ok],
+                                min_margin=MIN_MARGIN)
+    except Exception as exc:
+        return jsonify({"error": "tahmin hatasi: %s" % exc}), 500
+    t_inf = time.perf_counter() - t_inf
 
-        download_folder = os.path.join(application_path, DOWNLOAD_FOLDER)
-        os.makedirs(download_folder, exist_ok=True)
+    # data (bayt) alanlarini yanittan cikar, key ile eslestir
+    results = []
+    for c in res["candidates"]:
+        results.append({
+            "key": ok[c["index"]]["key"],
+            "score": round(c["score"], 4),
+            "direction": c["direction"],
+            "direction_confidence": round(c["direction_confidence"], 4),
+            "distance": round(c["distance"], 4),
+        })
+    winner = results[0]
+    total = time.perf_counter() - t_start
 
-        # ===================== PARALEL İNDİRME =====================
-        download_start = time.time()
-        print("📥 İndirme başlıyor...")
+    print("clue=%s -> %s | kazanan=%s skor=%.3f margin=%.3f%s | %.0f ms"
+          % (clue, res["clue"]["direction"], winner["key"], winner["score"],
+             res["margin"], " RETRY" if res["needs_retry"] else "", 1000 * total))
 
-        def download_image(key, prefix=""):
-            try:
-                url = urljoin(CAPTCHA_BASE_URL, key)
-                resp = requests.get(url, timeout=5, verify=False)
-                resp.raise_for_status()
-                ext = ".jpg" if "jpeg" in resp.headers.get("content-type", "").lower() else ".png"
-                filename = f"{prefix}{key}{ext}"
-                path = os.path.join(download_folder, filename)
-                with open(path, "wb") as f:
-                    f.write(resp.content)
-                return {"key": key, "url": url, "filename": filename, "path": path}
-            except Exception as e:
-                print(f"✗ {key} indirilemedi: {str(e)}")
-                return {"key": key, "error": str(e)}
+    return jsonify({
+        "success": True,
+        "winner": winner,
+        "results": results,
+        "clue": {
+            "key": clue,
+            "direction": res["clue"]["direction"],
+            "confidence": round(res["clue"]["confidence"], 4),
+            "certain": res["clue"]["certain"],
+        },
+        "margin": round(res["margin"], 4),
+        "needs_retry": res["needs_retry"],
+        "failed_downloads": failed,
+        "timing": {
+            "total_ms": round(1000 * total, 1),
+            "download_ms": round(1000 * t_dl, 1),
+            "inference_ms": round(1000 * t_inf, 1),
+        },
+    }), 200
 
-        # Tüm indirmeleri paralel yap
-        all_keys = [clue] + keys
-        prefixes = ["clue_"] + [""] * len(keys)
 
-        downloaded_files = []
-        failed_downloads = []
-        clue_info = None
+# ============================================
+# ENDPOINT: /direction
+# ============================================
+@app.route("/direction", methods=["POST"])
+def direction():
+    denied = require_api_key()
+    if denied:
+        return denied
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(download_image, k, p): (k, p) for k, p in zip(all_keys, prefixes)}
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if "error" in result:
-                    failed_downloads.append(result)
-                else:
-                    key, prefix = futures[future]
-                    if prefix == "clue_":
-                        clue_info = result
-                        print(f"✓ Clue: {result['filename']}")
-                    else:
-                        downloaded_files.append(result)
-                        print(f"✓ Key: {result['filename']}")
+    data = request.get_json(silent=True) or {}
+    key = data.get("key")
+    if not valid_key(key):
+        return jsonify({"error": "gecersiz key"}), 400
 
-        download_time = time.time() - download_start
-        print(f"⏱️  İndirme süresi: {download_time:.2f}s ({len(downloaded_files)} dosya)")
+    try:
+        clf = get_classifier()
+    except Exception as exc:
+        return jsonify({"error": "model yuklenemedi: %s" % exc}), 500
 
-        if not clue_info or not downloaded_files:
-            return jsonify({
-                "error": "Clue veya key dosyası indirilemedi",
-                "downloaded": len(downloaded_files),
-                "failed": len(failed_downloads)
-            }), 400
+    got = fetch_all([key])[0]
+    if "error" in got:
+        return jsonify({"error": "indirilemedi: %s" % got["error"]}), 502
 
-        # ===================== MODEL YÜKLEME =====================
-        model_start = time.time()
-        print("🧠 Model yükleniyor...")
+    cls, conf = clf.predict(got["data"])
+    return jsonify({
+        "success": True,
+        "key": key,
+        "direction": None if cls is None else clf.class_names[cls],
+        "confidence": round(float(conf), 4),
+        "certain": cls is not None,
+    }), 200
 
-        try:
-            model = get_model()
-        except Exception as e:
-            return jsonify({"error": f"Model yüklenirken hata: {str(e)}"}), 500
 
-        model_load_time = time.time() - model_start
-        print(f"⏱️  Model yükleme: {model_load_time:.2f}s")
-
-        # ===================== GÖRSEL İŞLEME =====================
-        def preprocess_batch(img_paths):
-            """Toplu ön işleme"""
-            batch = []
-            valid_indices = []
-            for i, path in enumerate(img_paths):
-                try:
-                    img = cv2.imread(path)
-                    if img is None:
-                        print(f"✗ {path} okunamadı")
-                        continue
-                    img = cv2.resize(img, IMG_SIZE)
-                    img = img.astype("float32") / 127.5 - 1.0
-                    batch.append(img)
-                    valid_indices.append(i)
-                except Exception as e:
-                    print(f"✗ {path} hata: {str(e)}")
-            return np.array(batch), valid_indices
-
-        preprocess_start = time.time()
-        print("🖼️  Görsel ön işleme başlıyor...")
-
-        all_paths = [clue_info["path"]] + [f["path"] for f in downloaded_files]
-        batch_images, valid_indices = preprocess_batch(all_paths)
-
-        preprocess_time = time.time() - preprocess_start
-        print(f"⏱️  Ön işleme süresi: {preprocess_time:.2f}s ({len(batch_images)} görsel)")
-
-        if len(batch_images) == 0:
-            return jsonify({"error": "Hiçbir görsel işlenemedi"}), 500
-
-        # ===================== EMBEDDİNG =====================
-        prediction_start = time.time()
-        print("🔮 Embedding hesaplanıyor...")
-
-        embeddings = model.predict(batch_images, verbose=0, batch_size=32)
-
-        prediction_time = time.time() - prediction_start
-        print(f"⏱️  Prediction süresi: {prediction_time:.2f}s")
-
-        # ===================== MESAFE HESAPLAMA =====================
-        clue_vec = embeddings[0]
-
-        results = []
-        key_start_idx = 1
-
-        for i, f in enumerate(downloaded_files):
-            embedding_idx = key_start_idx + i
-            if embedding_idx < len(embeddings):
-                dist = float(np.linalg.norm(clue_vec - embeddings[embedding_idx]))
-                results.append({
-                    "key": f["key"],
-                    "distance": dist,
-                    "path": f["path"]
-                })
-                print(f"{f['key']} → {dist:.4f}")
-
-        if not results:
-            return jsonify({"error": "Hiçbir mesafe hesaplanamadı"}), 500
-
-        winner = min(results, key=lambda x: x["distance"])
-
-        total_time = time.time() - start_time
-
-        print(f"\n🏆 Kazanan: {winner['key']} (Mesafe: {winner['distance']:.4f})")
-        print(f"⏱️  TOPLAM SÜRE: {total_time:.2f}s\n")
-
-        return jsonify({
-            "success": True,
-            "clue": clue_info,
-            "download_folder": download_folder,
-            "results": sorted(results, key=lambda x: x["distance"]),
-            "winner": winner,
-            "failed_downloads": failed_downloads,
-            "timing": {
-                "total": round(total_time, 2),
-                "download": round(download_time, 2),
-                "model_load": round(model_load_time, 2),
-                "preprocessing": round(preprocess_time, 2),
-                "prediction": round(prediction_time, 2)
-            }
-        }), 200
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+# ============================================
+# ENDPOINT: /health
+# ============================================
+@app.route("/health", methods=["GET"])
+def health():
+    loaded = _clf is not None
+    return jsonify({
+        "status": "ok",
+        "model_loaded": loaded,
+        "meta": META_PATH,
+        "tta_views": TTA_VIEWS,
+        "confidence_threshold": (round(_clf.conf_threshold, 4) if loaded else None),
+        "auth_required": bool(API_KEY),
+        "tls_verify": VERIFY_TLS,
+    }), 200
 
 
 # ============================================
 # MAIN
 # ============================================
-if __name__ == '__main__':
-    print("="*60)
-    print("CAPTCHA ÇÖZÜCÜ API")
-    print("="*60)
-    print(f"Model: {MODEL_PATH}")
-    print(f"Download klasörü: {DOWNLOAD_FOLDER}")
-    print("\nEndpoint'ler:")
-    print("  POST /download-photo - Captcha çöz")
-    print("\nÖrnek istek:")
-    print('  curl -X POST http://localhost:5000/download-photo \\')
-    print('    -H "Content-Type: application/json" \\')
-    print('    -d \'{"clue": "abc123", "keys": ["key1", "key2", "key3"]}\'')
-    print("="*60 + "\n")
+def main():
+    p = argparse.ArgumentParser(description="Captcha cozucu API")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="varsayilan 127.0.0.1 (sadece yerel). Aga acmak icin 0.0.0.0")
+    p.add_argument("--port", type=int, default=5000)
+    p.add_argument("--preload", action="store_true",
+                   help="modeli baslangicta yukle (ilk istek hizli olsun)")
+    args = p.parse_args()
 
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    print("=" * 62)
+    print("CAPTCHA COZUCU API")
+    print("=" * 62)
+    print("  metadata     : %s" % META_PATH)
+    print("  TTA views    : %d" % TTA_VIEWS)
+    print("  adres        : http://%s:%d" % (args.host, args.port))
+    print("  kimlik dogr. : %s" % ("X-API-Key zorunlu" if API_KEY
+                                   else "YOK (CAPTCHA_API_KEY ayarlanmadi)"))
+    print("  TLS dogrulama: %s" % ("acik" if VERIFY_TLS else "KAPALI (guvensiz)"))
+    if args.host not in ("127.0.0.1", "localhost") and not API_KEY:
+        print("\n  UYARI: servis aga acik ve kimlik dogrulamasi yok.")
+        print("         CAPTCHA_API_KEY ortam degiskenini ayarlamaniz onerilir.")
+    print("\nEndpointler:")
+    print("  POST /solve      {\"clue\": \"...\", \"keys\": [\"...\"]}")
+    print("  POST /direction  {\"key\": \"...\"}")
+    print("  GET  /health")
+    print("\nOrnek:")
+    print("  curl -X POST http://%s:%d/solve \\" % (args.host, args.port))
+    print("    -H 'Content-Type: application/json' \\")
+    if API_KEY:
+        print("    -H 'X-API-Key: <anahtar>' \\")
+    print("    -d '{\"clue\": \"abc\", \"keys\": [\"k1\", \"k2\", \"k3\"]}'")
+    print("=" * 62 + "\n")
+
+    if args.preload:
+        get_classifier()
+
+    app.run(debug=False, host=args.host, port=args.port, threaded=True)
+
+
+if __name__ == "__main__":
+    main()

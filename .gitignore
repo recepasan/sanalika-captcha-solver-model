@@ -43,6 +43,10 @@ dataset/
 # Training outputs
 *.png
 training_*.png
+inspect_*/
+*_predictions.csv
+*_centers.npy
+*_meta.json
 
 # IDE
 .vscode/
