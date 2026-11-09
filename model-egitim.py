@@ -782,10 +782,26 @@ def main():
 
     plot_history(histories, plot_path)
 
+    # Otomatik ONNX disa aktarma (hafif ve hizli cikarim icin)
+    onnx_path = os.path.splitext(args.out)[0] + ".onnx"
+    try:
+        import tf2onnx
+        spec = (tf.TensorSpec((None, img_size[0], img_size[1], 3), tf.float32, name="image"),)
+        tf2onnx.convert.from_keras(embed, input_signature=spec, output_path=onnx_path, opset=13)
+        meta_onnx = dict(meta)
+        meta_onnx["embedding_model"] = onnx_path
+        meta_onnx_path = os.path.splitext(meta_path)[0] + "_onnx.json"
+        with open(meta_onnx_path, "w") as fh:
+            json.dump(meta_onnx, fh, indent=2)
+    except Exception as exc:
+        onnx_path = None
+
     print("\n" + "=" * 62)
     print("Kaydedilenler")
     print("=" * 62)
     print("  %-38s embedding modeli" % args.out)
+    if onnx_path and os.path.exists(onnx_path):
+        print("  %-38s ONNX modeli (hafif runtime)" % onnx_path)
     print("  %-38s sinif merkezleri" % centers_path)
     print("  %-38s esik + metadata" % meta_path)
     print("  %-38s hatali/sinirda gorseller" % ("inspect_%s/" % prefix))
