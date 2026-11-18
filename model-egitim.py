@@ -49,17 +49,20 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import Input, layers, models
-from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras import Input, applications, layers, models
 
 AUTOTUNE = tf.data.AUTOTUNE
 SEED = 42
+
+BACKBONES = ("mobilenetv2", "mobilenetv3small", "mobilenetv3large")
 
 # Saat yonunde, yukaridan baslayarak 45 derece adimlarla.
 DIRECTION_ORDER = [
@@ -80,7 +83,20 @@ DIRECTION_ORDER = [
 def parse_args():
     p = argparse.ArgumentParser(description="Captcha yon siniflandirma egitimi")
     p.add_argument("--dataset", default="dataset")
-    p.add_argument("--img-size", type=int, default=128)
+    p.add_argument("--img-size", type=int, default=128, help="kare giris (H=W)")
+    p.add_argument("--img-h", type=int, default=None,
+                   help="giris yuksekligi (--img-size'i ezer)")
+    p.add_argument("--img-w", type=int, default=None,
+                   help="giris genisligi (--img-size'i ezer). Gorseller ~30x63, "
+                        "orani korumak icin orn. --img-h 128 --img-w 64")
+    p.add_argument("--backbone", choices=BACKBONES, default="mobilenetv2")
+    p.add_argument("--folds", type=int, default=0,
+                   help=">=2 ise K-fold capraz dogrulama: model kaydedilmez, "
+                        "her gorsel bir kez test edilir, ozet rapor yazilir")
+    p.add_argument("--sim-tasks", type=int, default=3000,
+                   help="fold basina sentetik captcha gorevi sayisi")
+    p.add_argument("--sim-options", type=int, default=4,
+                   help="captcha basina secenek sayisi (1 dogru + n-1 yanlis)")
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--epochs-head", type=int, default=6, help="backbone donuk asama")
     p.add_argument("--epochs-finetune", type=int, default=40)
@@ -321,12 +337,23 @@ class CosFaceHead(layers.Layer):
         return cfg
 
 
-def build_models(img_size, embed_dim, n_classes, dropout):
-    base = MobileNetV2(
-        input_shape=(img_size[0], img_size[1], 3),
-        include_top=False,
-        weights="imagenet",
-    )
+def make_backbone(name, img_size):
+    shape = (img_size[0], img_size[1], 3)
+    if name == "mobilenetv2":
+        return applications.MobileNetV2(
+            input_shape=shape, include_top=False, weights="imagenet")
+    ctor = {
+        "mobilenetv3small": applications.MobileNetV3Small,
+        "mobilenetv3large": applications.MobileNetV3Large,
+    }[name]
+    # include_preprocessing=False: girdi [-1,1] bekler; pipeline zaten bunu uretiyor.
+    # Varsayilan (True) [0,255] bekler ve sessizce yanlis normalizasyona yol acar.
+    return ctor(input_shape=shape, include_top=False, weights="imagenet",
+                include_preprocessing=False)
+
+
+def build_models(img_size, embed_dim, n_classes, dropout, backbone="mobilenetv2"):
+    base = make_backbone(backbone, img_size)
     base.trainable = False
 
     inp = Input(shape=(img_size[0], img_size[1], 3), name="image")
@@ -630,16 +657,15 @@ def plot_history(histories, out_png="training.png"):
 
 
 # ----------------------------------------------------------------------------
-# main
+# Egitim (normal mod ve K-fold modu ortak kullanir)
 # ----------------------------------------------------------------------------
-def main():
-    args = parse_args()
-    setup_runtime()
+def resolve_img_size(args):
+    h = args.img_h if args.img_h else args.img_size
+    w = args.img_w if args.img_w else args.img_size
+    return (int(h), int(w))
 
-    img_size = (args.img_size, args.img_size)
-    paths, labels, class_names = load_index(args.dataset)
-    n_classes = len(class_names)
 
+def aug_flags(args, class_names, img_size):
     geom_ok = class_names == DIRECTION_ORDER
     if not geom_ok:
         print(
@@ -650,44 +676,56 @@ def main():
     hflip = geom and not args.no_hflip
     vflip = geom and not args.no_vflip
     rot = args.rot90 and geom
+    if rot and img_size[0] != img_size[1]:
+        raise SystemExit("--rot90 kare olmayan giris ile kullanilamaz (H ve W yer degistirir)")
+    print("Augmentation -> yatay cevirme: %s | dikey cevirme: %s | rot90: %s"
+          % ("acik" if hflip else "kapali",
+             "acik" if vflip else "kapali",
+             "acik" if rot else "kapali"))
+    return hflip, vflip, rot
 
-    tr, va = stratified_split(labels, args.val_frac)
-    print("\nSplit (gorsel seviyesinde): train=%d  val=%d" % (len(tr), len(va)))
+
+def max_tta_views(hflip, vflip):
+    """Cikarimda kullanilabilecek en fazla TTA: sadece egitimde gorulen donusumler."""
+    if hflip and vflip:
+        return 4
+    return 2 if hflip else 1
+
+
+def train_model(args, paths, labels, tr, va, class_names, img_size, flags,
+                ckpt=None, verbose=1, use_cache_file=True):
+    """Iki asamali egitim. ckpt verilirse val_accuracy ile en iyi epoch secilir
+    (normal mod). ckpt=None ise sabit takvim sonundaki agirliklar kullanilir;
+    K-fold modunda test fold'u model secimine karismasin diye boyle."""
+    hflip, vflip, rot = flags
+    n_classes = len(class_names)
 
     counts = np.bincount(labels[tr], minlength=n_classes).astype(np.float32)
     class_weights = np.where(counts > 0, counts.mean() / np.maximum(counts, 1.0), 0.0)
     print("Sinif agirliklari: %s"
           % np.array2string(class_weights, precision=2, floatmode="fixed"))
-    print("Augmentation -> yatay cevirme: %s | dikey cevirme: %s | rot90: %s"
-          % ("acik" if hflip else "kapali",
-             "acik" if vflip else "kapali",
-             "acik" if rot else "kapali"))
 
+    cache = args.cache_file if (args.cache_file and use_cache_file) else ""
     train_ds = build_dataset(
         paths[tr], labels[tr], img_size, args.batch, n_classes,
         class_weights=class_weights, training=True,
         hflip=hflip, vflip=vflip, rot=rot,
-        cache_file=(args.cache_file + ".train") if args.cache_file else "",
+        cache_file=(cache + ".train") if cache else "",
     )
     val_ds = build_dataset(
         paths[va], labels[va], img_size, args.batch, n_classes, training=False,
-        cache_file=(args.cache_file + ".val") if args.cache_file else "",
+        cache_file=(cache + ".val") if cache else "",
     )
 
     base, embed, clf, head = build_models(
-        img_size, args.embed_dim, n_classes, args.dropout
+        img_size, args.embed_dim, n_classes, args.dropout, args.backbone
     )
-    print("\nEmbedding boyutu: %d | backbone: MobileNetV2" % args.embed_dim)
+    print("Embedding boyutu: %d | backbone: %s | giris: %dx%d (HxW)"
+          % (args.embed_dim, args.backbone, img_size[0], img_size[1]))
     print("Egitilebilir parametre (asama 1): %d"
           % int(sum(np.prod(w.shape) for w in clf.trainable_weights)))
 
     margin_var = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="margin")
-    prefix = Path(args.out).stem
-    ckpt = "%s_best.weights.h5" % prefix
-    centers_path = "%s_centers.npy" % prefix
-    meta_path = "%s_meta.json" % prefix
-    plot_path = "%s_training.png" % prefix
-    print("Cikti onendeki: %s_*  (checkpoint, centers, meta, grafik)" % prefix)
     steps = int(math.ceil(len(tr) / float(args.batch)))
     histories = []
 
@@ -709,7 +747,7 @@ def main():
                 validation_data=val_ds,
                 epochs=args.epochs_head,
                 callbacks=[MarginWarmup(margin_var, args.margin, args.epochs_head)],
-                verbose=1,
+                verbose=verbose,
             )
         )
 
@@ -731,29 +769,254 @@ def main():
     print("Egitilebilir parametre (asama 2): %d"
           % int(sum(np.prod(w.shape) for w in clf.trainable_weights)))
 
+    callbacks = []
+    if ckpt:
+        callbacks = [
+            tf.keras.callbacks.ModelCheckpoint(
+                ckpt, monitor="val_accuracy", mode="max",
+                save_best_only=True, save_weights_only=True, verbose=1,
+            ),
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_accuracy", mode="max", patience=12,
+                restore_best_weights=True, verbose=1,
+            ),
+            tf.keras.callbacks.TensorBoard(log_dir="logs_direction"),
+        ]
     histories.append(
         clf.fit(
             train_ds,
             validation_data=val_ds,
             epochs=args.epochs_finetune,
-            callbacks=[
-                tf.keras.callbacks.ModelCheckpoint(
-                    ckpt, monitor="val_accuracy", mode="max",
-                    save_best_only=True, save_weights_only=True, verbose=1,
-                ),
-                tf.keras.callbacks.EarlyStopping(
-                    monitor="val_accuracy", mode="max", patience=12,
-                    restore_best_weights=True, verbose=1,
-                ),
-                tf.keras.callbacks.TensorBoard(log_dir="logs_direction"),
-            ],
-            verbose=1,
+            callbacks=callbacks,
+            verbose=verbose,
         )
     )
 
-    if Path(ckpt).exists():
+    if ckpt and Path(ckpt).exists():
         clf.load_weights(ckpt)
         print("\nEn iyi agirliklar geri yuklendi: %s" % ckpt)
+
+    return embed, head, histories
+
+
+# ----------------------------------------------------------------------------
+# K-fold degerlendirme: TTA skorlari + uctan uca captcha simulasyonu
+# ----------------------------------------------------------------------------
+def softmax_np(x):
+    x = x - x.max(axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def load_inputs(paths, img_size, batch):
+    ds = (
+        tf.data.Dataset.from_tensor_slices(paths)
+        .map(lambda p: to_model_input(decode(p, img_size)), num_parallel_calls=AUTOTUNE)
+        .batch(batch)
+    )
+    return np.concatenate([b.numpy() for b in ds], axis=0)
+
+
+def tta_scores(embed, x, centers, views):
+    """direction_infer.DirectionClassifier.scores_batch ile ayni mantik."""
+    n = centers.shape[0]
+    perm_h = np.array([(n - i) % n for i in range(n)], dtype=np.int32)
+    perm_v = np.array([(n // 2 - i) % n for i in range(n)], dtype=np.int32)
+    variants = [(x, None)]
+    if views >= 2:
+        variants.append((x[:, :, ::-1, :], perm_h))
+    if views == 4:
+        variants.append((x[:, ::-1, :, :], perm_v))
+        variants.append((x[:, ::-1, ::-1, :], perm_h[perm_v]))
+    total = np.zeros((len(x), n), dtype=np.float32)
+    for v, perm in variants:
+        e = embed.predict(np.ascontiguousarray(v), batch_size=256, verbose=0)
+        e = e.astype(np.float32)
+        e /= np.linalg.norm(e, axis=1, keepdims=True) + 1e-9
+        s = e @ centers.T
+        total += s if perm is None else s[:, perm]
+    return total / float(len(variants))
+
+
+def simulate_captcha(s, labels, scale, n_tasks, n_options, rng, min_margin=0.10):
+    """1 dogru + (n_options-1) yanlis secenekli sentetik captcha gorevleri.
+    Yanlis secenekler clue'dan ve birbirinden farkli yonlerden secilir.
+    Skorlama direction_infer.solve_captcha ile ayni: P(ayni yon) = p_clue . p_secenek
+    """
+    n_classes = s.shape[1]
+    p = softmax_np(scale * s)
+    by_class = [np.where(labels == c)[0] for c in range(n_classes)]
+    ok = retry = ok_accepted = done = 0
+    for _ in range(n_tasks):
+        c = int(rng.integers(n_classes))
+        if len(by_class[c]) < 2:
+            continue
+        clue, right = rng.choice(by_class[c], 2, replace=False)
+        others = rng.choice([k for k in range(n_classes) if k != c],
+                            n_options - 1, replace=False)
+        cands = np.array([right] + [rng.choice(by_class[k]) for k in others])
+        agree = p[cands] @ p[clue]
+        norm = agree / (agree.sum() or 1.0)
+        order = np.argsort(-agree)
+        success = int(order[0]) == 0
+        margin = float(norm[order[0]] - norm[order[1]])
+        done += 1
+        ok += success
+        if margin < min_margin:
+            retry += 1
+        else:
+            ok_accepted += success
+    accepted = done - retry
+    return {
+        "tasks": done,
+        "success": ok / float(done),
+        "retry_rate": retry / float(done),
+        "accepted_success": (ok_accepted / float(accepted)) if accepted else 0.0,
+        "accepted_errors": int(accepted - ok_accepted),
+    }
+
+
+def stratified_kfold(labels, k, seed=SEED):
+    rng = np.random.default_rng(seed)
+    fold_of = np.empty(len(labels), dtype=np.int32)
+    for c in np.unique(labels):
+        idx = np.where(labels == c)[0]
+        rng.shuffle(idx)
+        fold_of[idx] = np.arange(len(idx)) % k
+    out = []
+    for f in range(k):
+        tr = np.where(fold_of != f)[0]
+        rng.shuffle(tr)
+        out.append((tr, np.where(fold_of == f)[0]))
+    return out
+
+
+def run_cv(args, paths, labels, class_names, img_size, flags):
+    k = int(args.folds)
+    n_classes = len(class_names)
+    folds = stratified_kfold(labels, k)
+    views_all = (1, 2, 4)
+    rec_views = max_tta_views(flags[0], flags[1])
+    prefix = Path(args.out).stem
+
+    oof = {v: np.zeros((len(labels), n_classes), dtype=np.float32) for v in views_all}
+    fold_acc = {v: [] for v in views_all}
+    sim = {v: [] for v in views_all}
+    t0 = time.time()
+
+    for f, (tr, va) in enumerate(folds):
+        print("\n" + "#" * 62)
+        print("FOLD %d/%d  train=%d  test=%d" % (f + 1, k, len(tr), len(va)))
+        print("#" * 62)
+        tf.keras.backend.clear_session()
+        tf.random.set_seed(SEED + f)
+        np.random.seed(SEED + f)
+        embed, head, _ = train_model(
+            args, paths, labels, tr, va, class_names, img_size, flags,
+            ckpt=None, verbose=2, use_cache_file=False,
+        )
+        centers = head.centers()
+        x = load_inputs(paths[va], img_size, args.batch)
+        for v in views_all:
+            s = tta_scores(embed, x, centers, v)
+            oof[v][va] = s
+            acc = float((s.argmax(1) == labels[va]).mean())
+            fold_acc[v].append(acc)
+            sim[v].append(simulate_captcha(
+                s, labels[va], args.scale, args.sim_tasks, args.sim_options,
+                np.random.default_rng(SEED + 1000 + f)))
+        print("FOLD %d sonuc: " % (f + 1) + " | ".join(
+            "TTA%d acc=%.2f%%" % (v, 100 * fold_acc[v][-1]) for v in views_all))
+        del embed, head
+
+    elapsed = time.time() - t0
+    print("\n" + "=" * 62)
+    print("K-FOLD OZETI (%d fold, %d gorselin her biri bir kez test edildi)"
+          % (k, len(labels)))
+    print("config: backbone=%s giris=%dx%d hflip=%s vflip=%s rot90=%s"
+          % (args.backbone, img_size[0], img_size[1], flags[0], flags[1], flags[2]))
+    print("onerilen TTA (egitimde gorulen donusumler): %d" % rec_views)
+    print("=" * 62)
+    summary = {
+        "config": {
+            "backbone": args.backbone, "img_size": list(img_size),
+            "hflip": bool(flags[0]), "vflip": bool(flags[1]), "rot90": bool(flags[2]),
+            "embed_dim": args.embed_dim, "epochs_head": args.epochs_head,
+            "epochs_finetune": args.epochs_finetune, "folds": k,
+            "sim_options": args.sim_options, "sim_tasks_per_fold": args.sim_tasks,
+        },
+        "recommended_tta_views": rec_views,
+        "elapsed_sec": round(elapsed, 1),
+        "tta": {},
+    }
+    for v in views_all:
+        pred = oof[v].argmax(1)
+        wrong = pred != labels
+        cd = circular_distance(pred[wrong], labels[wrong], n_classes)
+        dist = {str(d): int((cd == d).sum()) for d in range(1, n_classes // 2 + 1)}
+        a = np.array(fold_acc[v])
+        tasks = sum(r["tasks"] for r in sim[v])
+        succ = sum(r["success"] * r["tasks"] for r in sim[v]) / tasks
+        retry = sum(r["retry_rate"] * r["tasks"] for r in sim[v]) / tasks
+        acc_err = sum(r["accepted_errors"] for r in sim[v])
+        print("TTA%d  gorsel acc=%.2f%% (+/-%.2f, fold std)  hata=%d  "
+              "[45:%s 90:%s 135:%s 180:%s]"
+              % (v, 100 * a.mean(), 100 * a.std(), int(wrong.sum()),
+                 dist["1"], dist["2"], dist["3"], dist["4"]))
+        print("      captcha (%d secenek, %d gorev): basari=%.2f%%  retry=%.2f%%  "
+              "retry sonrasi hata=%d"
+              % (args.sim_options, tasks, 100 * succ, 100 * retry, acc_err))
+        summary["tta"][str(v)] = {
+            "image_acc_mean": round(float(a.mean()), 5),
+            "image_acc_std": round(float(a.std()), 5),
+            "fold_acc": [round(float(x), 5) for x in a],
+            "errors": int(wrong.sum()),
+            "error_circular_dist": dist,
+            "captcha_success": round(float(succ), 5),
+            "captcha_retry_rate": round(float(retry), 5),
+            "captcha_errors_after_retry": int(acc_err),
+        }
+    print("Sure: %.1f dk" % (elapsed / 60.0))
+
+    out_json = "%s_cv.json" % prefix
+    out_npz = "%s_cv_oof.npz" % prefix
+    with open(out_json, "w") as fh:
+        json.dump(summary, fh, indent=2)
+    np.savez_compressed(out_npz, labels=labels, paths=paths,
+                        **{"scores_tta%d" % v: oof[v] for v in views_all})
+    print("Ozet -> %s | gorsel bazinda skorlar -> %s" % (out_json, out_npz))
+
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+def main():
+    args = parse_args()
+    setup_runtime()
+
+    img_size = resolve_img_size(args)
+    paths, labels, class_names = load_index(args.dataset)
+    n_classes = len(class_names)
+    flags = aug_flags(args, class_names, img_size)
+    hflip, vflip, _ = flags
+
+    if args.folds and args.folds >= 2:
+        run_cv(args, paths, labels, class_names, img_size, flags)
+        return
+
+    tr, va = stratified_split(labels, args.val_frac)
+    print("\nSplit (gorsel seviyesinde): train=%d  val=%d" % (len(tr), len(va)))
+
+    prefix = Path(args.out).stem
+    ckpt = "%s_best.weights.h5" % prefix
+    centers_path = "%s_centers.npy" % prefix
+    meta_path = "%s_meta.json" % prefix
+    plot_path = "%s_training.png" % prefix
+    print("Cikti onekleri: %s_*  (checkpoint, centers, meta, grafik)" % prefix)
+
+    embed, head, histories = train_model(
+        args, paths, labels, tr, va, class_names, img_size, flags, ckpt=ckpt,
+    )
 
     centers = head.centers()
     acc, thr, conf_thr = report(
@@ -768,11 +1031,15 @@ def main():
         "centers": centers_path,
         "class_names": class_names,
         "embed_dim": int(args.embed_dim),
+        "backbone": args.backbone,
         "img_size": list(img_size),
         "preprocess": "resize -> float32/127.5 - 1.0",
         "embedding_normalized": True,
         "cosface_scale": float(args.scale),
         "cosface_margin": float(args.margin),
+        "augmentation": {"hflip": bool(hflip), "vflip": bool(vflip),
+                         "rot90": bool(flags[2])},
+        "max_tta_views": max_tta_views(hflip, vflip),
         "recommended_pair_threshold": round(float(thr), 3),
         "recommended_confidence_threshold": round(float(conf_thr), 3),
         "val_direction_accuracy": round(float(acc), 4),
@@ -794,6 +1061,8 @@ def main():
         with open(meta_onnx_path, "w") as fh:
             json.dump(meta_onnx, fh, indent=2)
     except Exception as exc:
+        print("ONNX disa aktarma atlandi (%s). Sonra: python export_onnx.py --meta %s"
+              % (exc, meta_path))
         onnx_path = None
 
     print("\n" + "=" * 62)
@@ -806,12 +1075,10 @@ def main():
     print("  %-38s esik + metadata" % meta_path)
     print("  %-38s hatali/sinirda gorseller" % ("inspect_%s/" % prefix))
     print("  %-38s tum val tahminleri" % ("%s_predictions.csv" % prefix))
-    print("\nSonraki adim - esigi TTA ile kalibre et:")
-    print("  python direction_infer.py --meta %s \\" % meta_path)
-    print("      --eval %s_predictions.csv --tta-views 4 --save-threshold" % prefix)
     print("\nCaptcha cozme:")
     print("  from direction_infer import DirectionClassifier")
-    print("  clf = DirectionClassifier('%s', tta_views=4)" % meta_path)
+    print("  clf = DirectionClassifier('%s', tta_views=%d)"
+          % (meta_path, max_tta_views(hflip, vflip)))
     print("  sonuc = clf.solve_captcha('clue.png', ['opt1.png', 'opt2.png', ...])")
     print("\nTek gorselden yon:")
     print("  cls, conf = clf.predict('gorsel.png')   # conf < %.3f ise emin degil"

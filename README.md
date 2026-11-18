@@ -49,7 +49,23 @@ python model-egitim.py --dataset dataset --embed-dim 128 --epochs-finetune 40
 python model-egitim.py --rot90              # 90° dönüşleri de augmentation'a ekle
 python model-egitim.py --no-vflip           # dikey çevirmeyi kapat
 python model-egitim.py --out model_v2.keras # tüm çıktı adları bundan türer
+python model-egitim.py --img-h 128 --img-w 64            # kare olmayan giriş (görseller ~30×63)
+python model-egitim.py --backbone mobilenetv3large      # mobilenetv2 | mobilenetv3small | mobilenetv3large
 ```
+
+### 1b. K-fold karşılaştırma (ayar seçmek için)
+
+```bash
+python model-egitim.py --folds 5 --no-vflip --img-h 128 --img-w 64 --out deneme.keras
+```
+
+Tek bir 503 görsellik validation setinde %99.2 ile %99.7 arasındaki fark 2-3 görseldir ve gürültüden ayırt edilemez. `--folds K` her görseli bir kez test eder, model kaydetmez ve şunları raporlar:
+
+- TTA 1/2/4 için görsel accuracy (fold ortalaması ± std) ve dairesel hata dağılımı
+- Sentetik captcha başarısı (`--sim-options` seçenek, `--sim-tasks` görev/fold), retry oranı ve retry sonrası kalan hata
+- `deneme_cv.json` (özet) ve `deneme_cv_oof.npz` (görsel bazında skorlar, configler arası eşleştirilmiş karşılaştırma için)
+
+K-fold modunda early stopping / en iyi epoch seçimi yapılmaz; test fold'u model seçimine karışmasın diye sabit takvimin son ağırlıkları kullanılır. Bu yüzden sonuçlar normal moddaki val skorundan biraz düşük çıkabilir.
 
 Üretilen dosyalar (`--out` adından türetilir, eski koşuların üzerine yazılmaz):
 

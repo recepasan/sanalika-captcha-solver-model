@@ -47,6 +47,9 @@ inspect_*/
 *_predictions.csv
 *_centers.npy
 *_meta.json
+*_cv.json
+*_cv_oof.npz
+runs/
 
 # IDE
 .vscode/
